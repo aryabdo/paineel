@@ -243,3 +243,50 @@ class RoDouConfig(BaseModel):
     """Represents the overall configuration in the YAML file."""
 
     dag: DAGConfig = Field(description="Instanciação da DAG")
+
+
+class CommandConfig(BaseModel):
+    """Configuration for a single script execution command."""
+
+    task_id: Optional[str] = Field(
+        default=None, description="Identificador da tarefa no Airflow"
+    )
+    type: str = Field(description="Tipo do comando: 'python' ou 'bash'")
+    script: str = Field(description="Caminho para o script a ser executado")
+    args: Optional[List[str]] = Field(
+        default_factory=list, description="Lista de argumentos do script"
+    )
+
+
+class GenericDAGConfig(BaseModel):
+    """Simplified DAG configuration used for generic script execution."""
+
+    id: str = Field(description="Nome único da DAG")
+    description: Optional[str] = Field(default=None, description="Descrição da DAG")
+    tags: Optional[Set[str]] = Field(
+        default={"generated_dag"},
+        description="Conjunto de tags para filtragem da DAG no Airflow",
+    )
+    owner: Optional[List[str]] = Field(
+        default=[], description="Lista de owners para filtragem da DAG no Airflow"
+    )
+    schedule: Optional[str] = Field(default=None, description="Expressão cron")
+    params: Optional[dict] = Field(
+        default_factory=dict,
+        description="Parâmetros da DAG expostos na UI do Airflow",
+    )
+    commands: List[CommandConfig] = Field(
+        description="Lista de comandos a serem executados pela DAG"
+    )
+
+    @field_validator("tags")
+    @staticmethod
+    def add_generated_tag(tags_param: Optional[Set[str]]) -> Set[str]:
+        tags_param.update({"generated_dag"})
+        return tags_param
+
+
+class GenericConfig(BaseModel):
+    """Wrapper para configuração genérica de DAG."""
+
+    dag: GenericDAGConfig = Field(description="Instanciação da DAG genérica")
