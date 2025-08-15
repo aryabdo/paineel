@@ -296,7 +296,9 @@ class DouDigestDagGenerator:
         with dag:
             previous_task = None
             for command in specs.commands:
-                raw_task_id = command.task_id or os.path.basename(command.script).replace(".", "_")
+                raw_task_id = (
+                    command.task_id or os.path.basename(command.script).replace(".", "_")
+                )
                 task_id = f"pa_{raw_task_id}"
                 if command.type.lower() == "bash":
                     bash_command = (
