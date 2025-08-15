@@ -1,0 +1,39 @@
+dag:
+  id: isa_energia
+  description: Pesquisa matérias de interesse da ISA Energia.
+  schedule: 0 5,17 * * *
+  search:
+    header: Pesquisa ISA ENERGIA
+    sources:
+      - DOU
+#      - INLABS
+    dou_sections:
+      - TODOS
+    field: TUDO
+    force_rematch: true
+    is_exact_search: false
+    ignore_signature_match: false
+    full_text: true
+    department:
+      - Ministério de Minas e Energia
+    department_ignore:
+      - AGÊNCIA NACIONAL DE MINERAÇÃO
+      - ANM
+      - Agência Nacional de Mineração
+      - AGÊNCIA NACIONAL DO PETRÓLEO, GÁS NATURAL E BIOCOMBUSTÍVEIS
+      - PETROLEO BRASILEIRO S.A.
+      - Petróleo Brasileiro S.A.
+      - Agência Nacional do Petróleo, Gás Natural e Biocombustíveis
+    terms:
+      - ISA ENERGIA
+      - CTEEP
+      - COMPANHIA DE TRANSMISSÃO DE ENERGIA ELÉTRICA PAULISTA
+      - INTERLIGAÇÃO ELÉTRICA
+  report:
+    emails:
+      - ary@hscl.adv.br
+      - asamia@brasil.isaenergia.com
+    attach_csv: true
+    subject: "Leitura - ISA ENERGIA"
+    no_results_found_text: "Nenhum dos termos pesquisados foi encontrado nesta consulta."
+    skip_null: false

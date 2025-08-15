@@ -1,0 +1,12 @@
+gspread
+oauth2client
+selenium
+python-2captcha
+2captcha-python
+pillow
+pytesseract
+colorama
+requests
+beautifulsoup4
+google-api-python-client
+python-crontab

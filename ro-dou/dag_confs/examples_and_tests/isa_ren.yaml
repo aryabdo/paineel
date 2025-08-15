@@ -1,0 +1,50 @@
+dag:
+  id: isa_ren
+  description: Pesquisa normativos ANEEL
+  schedule: 0 5,17 * * *
+  search:
+    header: Pesquisa Atos Normativos
+    sources:
+      - DOU
+#      - INLABS
+    dou_sections:
+      - TODOS
+    field: TITULO
+    force_rematch: true
+    is_exact_search: false
+    ignore_signature_match: false
+    full_text: true
+    department:
+      - Ministério de Minas e Energia
+    department_ignore:
+      - AGÊNCIA NACIONAL DE MINERAÇÃO
+      - ANM
+      - Agência Nacional de Mineração
+      - AGÊNCIA NACIONAL DO PETRÓLEO, GÁS NATURAL E BIOCOMBUSTÍVEIS
+      - PETRÓLEO BRASILEIRO S.A.
+      - Agência Nacional do Petróleo, Gás Natural e Biocombustíveis
+      - Petróleo Brasileiro S.A.
+    terms:
+      - PORTARIA
+      - RESOLUÇÃO NORMATIVA
+      - RESOLUÇÃO AUTORIZATIVA
+      - RESOLUÇÃO HOMOLOGATÓRIA
+      - RETIFICAÇÃO
+      - AUDIÊNCIA PÚBLICA
+      - TOMADA DE SUBSÍDIOS
+      - CONSULTA PÚBLICA
+      - CONSULTA EXTERNA
+      - TRANSMISSORAS DE ENERGIA
+      - REVISAO TARIFARIA PERIODICA
+      - REVISAO ANUAL
+      - REIDI
+      - TFSEE
+      - RGR
+  report:
+    emails:
+      - ary@hscl.adv.br
+      - asamia@brasil.isaenergia.com
+    attach_csv: true
+    subject: "Leitura Normativos - ISA ENERGIA"
+    no_results_found_text: "Nenhum dos termos pesquisados foi encontrado nesta consulta."
+    skip_null: false

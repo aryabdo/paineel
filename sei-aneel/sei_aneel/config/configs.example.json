@@ -1,0 +1,35 @@
+{
+  "smtp": {
+    "server": "smtp.exemplo.com",
+    "port": 587,
+    "user": "usuario",
+    "password": "senha",
+    "starttls": false
+  },
+  "twocaptcha": {
+    "api_key": "SUA_CHAVE_2CAPTCHA"
+  },
+  "google_drive": {
+    "credentials_file": "/caminho/para/credentials.json",
+    "sheet_name": "Processos ANEEL",
+    "worksheet_name": "Processos",
+    "backup_folder_id": "ID_DA_PASTA_DO_DRIVE"
+  },
+  "email": {
+    "recipients": {
+      "destinatario@exemplo.com": ["sei", "pauta", "sorteio"]
+    }
+  },
+  "paths": {
+    "tesseract": "/usr/bin/tesseract",
+    "chromedriver": "/usr/bin/chromedriver",
+    "chrome_binary": "/usr/bin/chromium-browser"
+  },
+  "execution": {
+    "captcha_max_tries": 5,
+    "max_retry_attempts": 5
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}

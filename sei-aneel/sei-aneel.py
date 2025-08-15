@@ -1,0 +1,1969 @@
+#!/usr/bin/env python3
+"""
+PAINEEL Automation System
+Sistema de monitoramento automatizado de processos PAINEEL
+
+Autor: Desenvolvido para automação de processos ANEEL
+Data: 2025
+"""
+
+import subprocess
+import sys
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+import argparse
+from datetime import datetime, timedelta
+import colorama
+from colorama import Fore, Back, Style
+import threading
+import signal
+
+from sei_aneel.config import DEFAULT_CONFIG_PATH, load_config
+from sei_aneel.email_utils import (
+    format_html_email,
+    attach_bytes,
+    hash_content,
+    create_xlsx,
+    get_recipients,
+)
+from sei_aneel.ui import InteractiveUI
+from sei_aneel.progress import ProgressTracker
+from sei_aneel.scheduler import ensure_cron
+
+# Inicializa colorama para Windows
+colorama.init(autoreset=True)
+
+import twocaptcha
+
+import time
+import re
+import csv
+import html
+import gspread
+import pytesseract
+import smtplib
+import platform
+import logging
+import shutil
+from urllib.parse import urljoin
+from itertools import zip_longest
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate
+from PIL import Image, ImageOps, ImageFilter
+from oauth2client.service_account import ServiceAccountCredentials
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
+
+class KeyboardHandler:
+    """Gerenciador de entradas de teclado"""
+    
+    def __init__(self, ui: InteractiveUI, tracker: ProgressTracker):
+        self.ui = ui
+        self.tracker = tracker
+        self.original_handler = None
+        
+    def setup_signal_handler(self):
+        """Configura handler para CTRL+C"""
+        def signal_handler(signum, frame):
+            self.ui.paused = not self.ui.paused
+            if self.ui.paused:
+                print(f"\n\n{Fore.YELLOW}⏸️  Execução pausada por solicitação do usuário.")
+                print(f"{Fore.GREEN}Pressione CTRL+C novamente para retomar ou 'q' para sair.")
+            else:
+                print(f"\n{Fore.GREEN}▶️  Execução retomada.")
+                
+        self.original_handler = signal.signal(signal.SIGINT, signal_handler)
+        
+    def restore_signal_handler(self):
+        """Restaura handler original"""
+        if self.original_handler:
+            signal.signal(signal.SIGINT, self.original_handler)
+
+class ConfigManager:
+    """Gerenciador de configurações do sistema"""
+
+    def __init__(self, config_path: str = None):
+        if config_path is None:
+            config_path = DEFAULT_CONFIG_PATH
+
+        self.config_path = config_path
+        self.config = load_config(self.config_path)
+
+    def load_config(self) -> Dict[str, Any]:
+        """Carrega configurações do arquivo JSON"""
+        try:
+            return load_config(self.config_path)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Arquivo de configuração não encontrado: {self.config_path}"
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Erro ao decodificar JSON: {e}")
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Obtém valor de configuração usando notação de ponto"""
+        keys = key.split('.')
+        value = self.config
+        try:
+            for k in keys:
+                value = value[k]
+            return value
+        except (KeyError, TypeError):
+            return default
+    
+    def validate_required_configs(self) -> List[str]:
+        """Valida configurações obrigatórias"""
+        required_configs = [
+            'smtp.server',
+            'smtp.user', 
+            'smtp.password',
+            'twocaptcha.api_key',
+            'google_drive.credentials_file',
+            'paths.tesseract',
+            'paths.chromedriver'
+        ]
+        
+        missing = []
+        for config in required_configs:
+            if not self.get(config):
+                missing.append(config)
+        
+        return missing
+    
+    def print_config_summary(self):
+        """Exibe resumo das configurações"""
+        print(f"\n{Fore.CYAN}📋 Resumo das Configurações:")
+        print(f"{Fore.WHITE}  📧 Email: {Fore.GREEN if self.get('smtp.server') else Fore.RED}{'Configurado' if self.get('smtp.server') else 'Não configurado'}")
+        print(f"{Fore.WHITE}  🔑 2captcha: {Fore.GREEN if self.get('twocaptcha.api_key') else Fore.RED}{'Configurado' if self.get('twocaptcha.api_key') else 'Não configurado'}")
+        print(f"{Fore.WHITE}  📊 Google Drive: {Fore.GREEN if self.get('google_drive.credentials_file') else Fore.RED}{'Configurado' if self.get('google_drive.credentials_file') else 'Não configurado'}")
+        print(f"{Fore.WHITE}  🌐 ChromeDriver: {Fore.GREEN if self.get('paths.chromedriver') else Fore.RED}{'Configurado' if self.get('paths.chromedriver') else 'Não configurado'}")
+        print(f"{Fore.WHITE}  👁️  Tesseract: {Fore.GREEN if self.get('paths.tesseract') else Fore.RED}{'Configurado' if self.get('paths.tesseract') else 'Não configurado'}")
+
+class Logger:
+    """Sistema de logging avançado"""
+    
+    def __init__(self, config: ConfigManager):
+        self.config = config
+        self.logger = self._setup_logger()
+    
+    def _setup_logger(self) -> logging.Logger:
+        """Configura o sistema de logging"""
+        logger = logging.getLogger("sei_aneel")
+        
+        # Remove handlers existentes
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        
+        # Configura nível de log
+        log_level = getattr(logging, self.config.get('logging.level', 'INFO').upper())
+        logger.setLevel(log_level)
+        
+        # Formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+        )
+        
+        # Handler para arquivo - ajusta path baseado no SO
+        if platform.system() == "Windows":
+            log_dir = Path(os.getcwd()) / "logs"
+        else:
+            log_dir = Path("/opt/sei-aneel/logs")
+        
+        log_dir.mkdir(exist_ok=True)
+        
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_dir / "sei_aneel.log",
+            maxBytes=self._parse_size(self.config.get('logging.max_file_size', '10MB')),
+            backupCount=self.config.get('logging.backup_count', 5),
+            encoding='utf-8'
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        
+        # Handler para console
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        return logger
+    
+    def _parse_size(self, size_str: str) -> int:
+        """Converte string de tamanho para bytes"""
+        size_str = size_str.upper().strip()
+        multipliers = {'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}
+        
+        for suffix, multiplier in multipliers.items():
+            if size_str.endswith(suffix):
+                return int(float(size_str[:-len(suffix)]) * multiplier)
+        
+        return int(size_str)  # Assume bytes se não especificado
+
+# Import do logging.handlers que foi esquecido
+import logging.handlers
+
+def configurar_paths(config: ConfigManager) -> Dict[str, Optional[str]]:
+    """
+    Configura os caminhos dos executáveis baseado no sistema operacional e configurações.
+    
+    Args:
+        config: Instância do ConfigManager
+        
+    Returns:
+        Dict contendo os caminhos para tesseract, chromedriver e chrome_binary
+    """
+    paths_config = config.get('paths', {})
+    
+    if platform.system() == "Windows":
+        # Para Windows, ajusta os paths base para o diretório atual se não especificado
+        base_dir = Path(os.getcwd())
+        data_dir = base_dir / "data"
+        data_dir.mkdir(exist_ok=True)
+        
+        return {
+            "tesseract": paths_config.get('tesseract', r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+            "chromedriver": paths_config.get('chromedriver', str(base_dir / "chromedriver.exe")),
+            "chrome_binary": paths_config.get('chrome_binary')
+        }
+    else:  # Linux
+        return {
+            "tesseract": paths_config.get('tesseract', "/usr/bin/tesseract"),
+            "chromedriver": paths_config.get('chromedriver', "/opt/sei-aneel/bin/chromedriver"),
+            "chrome_binary": paths_config.get('chrome_binary', "/usr/bin/chromium-browser")
+        }
+
+def operacao_com_retry(func, max_retries: int = 3, delay: float = 2, logger=None) -> Any:
+    """
+    Executa uma função com retry automático em caso de falha.
+    
+    Args:
+        func: Função a ser executada
+        max_retries: Número máximo de tentativas
+        delay: Delay inicial entre tentativas (aumenta exponencialmente)
+        logger: Logger para registrar tentativas
+    
+    Returns:
+        Resultado da função executada
+        
+    Raises:
+        Exception: Se todas as tentativas falharem
+    """
+    last_exception = None
+    for tentativa in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if tentativa == max_retries - 1:
+                if logger:
+                    logger.error(f"Falha após {max_retries} tentativas: {e}")
+                raise
+            if logger:
+                logger.warning(f"Erro na tentativa {tentativa+1}/{max_retries}, tentando novamente em {delay}s: {e}")
+            time.sleep(delay)
+            delay *= 2
+    
+    # Esta linha nunca deve ser alcançada, mas é boa prática
+    raise last_exception
+
+def validar_configuracoes(config: ConfigManager, paths: Dict[str, str], logger) -> bool:
+    """
+    Valida se todas as configurações e arquivos necessários estão presentes.
+    
+    Args:
+        config: Instância do ConfigManager
+        paths: Dicionário com caminhos dos executáveis
+        logger: Logger para registrar erros
+    
+    Returns:
+        True se todas as configurações estão válidas
+    """
+    erros = []
+    
+    # Verifica configurações obrigatórias
+    missing_configs = config.validate_required_configs()
+    if missing_configs:
+        erros.extend([f"Configuração obrigatória não definida: {cfg}" for cfg in missing_configs])
+    
+    # Verifica se o arquivo de credenciais existe
+    creds_file = config.get('google_drive.credentials_file')
+    if creds_file and not os.path.exists(creds_file):
+        erros.append(f"Arquivo de credenciais Google Drive não encontrado: {creds_file}")
+    
+    # Verifica se o chromedriver existe
+    if not os.path.exists(paths["chromedriver"]):
+        erros.append(f"ChromeDriver não encontrado: {paths['chromedriver']}")
+    
+    # Verifica se o tesseract existe
+    if not os.path.exists(paths["tesseract"]):
+        erros.append(f"Tesseract não encontrado: {paths['tesseract']}")
+    
+    if erros:
+        for erro in erros:
+            logger.error(erro)
+        return False
+    
+    return True
+
+def validar_numero_processo(numero: str) -> bool:
+    """Valida se o número do processo é válido"""
+    if not numero or not isinstance(numero, str):
+        return False
+    numero_str = str(numero).strip()
+    if not numero_str:
+        return False
+    numero_limpo = re.sub(r'\D', '', numero_str)
+    return len(numero_limpo) >= 5
+
+def normalizar_numero(numero: str) -> str:
+    """Remove caracteres não numéricos do número do processo"""
+    return re.sub(r'\D', '', numero or "")
+
+class CaptchaHandler:
+    """Gerenciador de resolução de CAPTCHA"""
+    
+    def __init__(self, driver, config: ConfigManager, logger, ui: InteractiveUI = None):
+        self.driver = driver
+        self.config = config
+        self.logger = logger
+        self.ui = ui
+        
+        api_key = config.get('twocaptcha.api_key')
+        if not api_key:
+            self.logger.error("ERRO: Chave API do 2captcha não configurada")
+            raise ValueError("Chave API do 2captcha é obrigatória")
+        
+        self.solver = twocaptcha.TwoCaptcha(api_key)
+        
+        # Ajusta temp_dir baseado no SO
+        if platform.system() == "Windows":
+            self.temp_dir = Path(os.getcwd()) / "temp"
+        else:
+            self.temp_dir = Path("/opt/sei-aneel/temp")
+        
+        self.temp_dir.mkdir(exist_ok=True)
+
+    def ocr_captcha_pil(self, img_path: str) -> str:
+        """
+        Processa imagem de captcha usando OCR local com otimizações.
+        
+        Args:
+            img_path: Caminho para a imagem do captcha
+            
+        Returns:
+            Texto extraído do captcha
+        """
+        try:
+            img = Image.open(img_path)
+            # Pipeline de processamento de imagem otimizado
+            img = img.convert('L')  # Converte para escala de cinza
+            img = ImageOps.autocontrast(img)  # Melhora contraste
+            
+            # Binarização com threshold adaptativo
+            threshold = 130
+            img = img.point(lambda x: 255 if x > threshold else 0)
+            
+            # Filtro para reduzir ruído
+            img = img.filter(ImageFilter.MedianFilter(size=3))
+            
+            # Configuração otimizada do Tesseract
+            ocr_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            captcha_text = pytesseract.image_to_string(img, config=ocr_config)
+            
+            return captcha_text.strip()
+        except Exception as e:
+            self.logger.error(f"Erro no OCR local: {e}")
+            return ""
+
+    def resolver_captcha(self, max_tentativas: int = None) -> str:
+        """Resolve CAPTCHA usando 2captcha com fallback para OCR local"""
+        if max_tentativas is None:
+            max_tentativas = self.config.get('execution.captcha_max_tries', 5)
+            
+        for tentativa in range(1, max_tentativas + 1):
+            if self.ui:
+                print(f"\n{Fore.YELLOW}🔍 Resolvendo captcha - Tentativa {tentativa}/{max_tentativas}")
+            self.logger.info(f"Tentativa {tentativa} de {max_tentativas} para resolver captcha via 2captcha")
+            
+            try:
+                img = WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.ID, "imgCaptcha"))
+                )
+                time.sleep(1)
+                captcha_bytes = img.screenshot_as_png
+                img_path = self.temp_dir / f"captcha_{tentativa}.png"
+                
+                with open(img_path, "wb") as f:
+                    f.write(captcha_bytes)
+                
+                # Tenta resolver com 2captcha
+                try:
+                    if self.ui:
+                        print(f"{Fore.CYAN}  🌐 Enviando para 2captcha...")
+                    result = self.solver.normal(str(img_path))
+                    captcha_text = result['code']
+                    if captcha_text and len(captcha_text) >= 4:
+                        if self.ui:
+                            print(f"{Fore.GREEN}  ✅ Captcha resolvido: {captcha_text}")
+                        self.logger.info(f"Captcha resolvido via 2captcha: {captcha_text}")
+                        return captcha_text
+                except Exception as e:
+                    if self.ui:
+                        print(f"{Fore.YELLOW}  ⚠️  2captcha falhou, tentando OCR local...")
+                    self.logger.warning(f"2captcha falhou: {e}. Tentando fallback OCR local.")
+                    
+                    # Fallback para OCR local
+                    texto = self.ocr_captcha_pil(str(img_path))
+                    texto_limpo = ''.join(filter(str.isalnum, texto))
+                    if texto_limpo and len(texto_limpo) >= 4:
+                        if self.ui:
+                            print(f"{Fore.GREEN}  ✅ Captcha resolvido via OCR: {texto_limpo}")
+                        self.logger.info(f"Captcha resolvido via fallback OCR: {texto_limpo}")
+                        return texto_limpo
+                
+                # Tenta recarregar o captcha
+                try:
+                    reload_btn = self.driver.find_element(By.ID, "imgRecaptcha")
+                    reload_btn.click()
+                    if self.ui:
+                        print(f"{Fore.YELLOW}  🔄 Recarregando captcha...")
+                    self.logger.info("Aguardando 3 segundos entre tentativas de captcha...")
+                    time.sleep(3)
+                except:
+                    self.logger.info("Aguardando 3 segundos entre tentativas de captcha...")
+                    time.sleep(3)
+                    
+            except Exception as e:
+                self.logger.error(f"Erro na tentativa {tentativa} de captcha: {e}")
+                time.sleep(3)
+        
+        if self.ui:
+            print(f"{Fore.RED}  ❌ Falha ao resolver captcha após {max_tentativas} tentativas")
+        self.logger.warning("Falha ao resolver captcha após múltiplas tentativas")
+        return ""
+
+    def limpar_captchas(self):
+        """Remove arquivos temporários de captcha"""
+        try:
+            for arquivo in self.temp_dir.glob('captcha_*.png'):
+                arquivo.unlink()
+        except Exception as e:
+            self.logger.warning(f"Erro ao limpar captchas: {e}")
+
+class SEIAneel:
+    """Classe principal para interação com o PAINEEL"""
+    
+    def __init__(self, driver, config: ConfigManager, logger, ui: InteractiveUI = None):
+        self.driver = driver
+        self.config = config
+        self.logger = logger
+        self.ui = ui
+        self.captcha_handler = CaptchaHandler(driver, config, logger, ui)
+
+    def pesquisar_e_entrar_processo(self, numero_processo: str) -> bool:
+        """
+        Pesquisa e acessa um processo específico no PAINEEL
+        
+        Args:
+            numero_processo: Número do processo a ser pesquisado
+            
+        Returns:
+            True se conseguiu acessar o processo, False caso contrário
+        """
+        if self.ui:
+            print(f"\n{Fore.CYAN}🔍 Acessando processo: {Fore.YELLOW}{numero_processo}")
+            
+        url = ("https://sei.aneel.gov.br/sei/modulos/pesquisa/"
+               "md_pesq_processo_pesquisar.php?acao_externa=protocolo_pesquisar"
+               "&acao_origem_externa=protocolo_pesquisar&id_orgao_acesso_externo=0")
+        
+        self.driver.get(url)
+        WebDriverWait(self.driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        # Localiza o campo de processo
+        campo_proc = None
+        selectors = [
+            (By.ID, "txtProtocoloPesquisa"),
+            (By.XPATH, "//input[@name='txtProtocoloPesquisa']"),
+            (By.XPATH, "//input[contains(@placeholder, 'Processo')]")
+        ]
+        
+        for selector in selectors:
+            try:
+                campo_proc = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located(selector)
+                )
+                break
+            except:
+                continue
+        
+        if not campo_proc:
+            if self.ui:
+                print(f"{Fore.RED}  ❌ Campo de processo não encontrado")
+            self.logger.error("Campo de processo não encontrado")
+            return False
+
+        # Preenche o número do processo
+        numero_processo = str(numero_processo).strip()
+        campo_proc.clear()
+        campo_proc.send_keys(numero_processo)
+        time.sleep(0.3)
+        
+        # Verifica se foi preenchido corretamente
+        valor_atual = campo_proc.get_attribute('value')
+        if valor_atual != numero_processo:
+            if self.ui:
+                print(f"{Fore.YELLOW}  ⚠️  Tentando preenchimento via JavaScript...")
+            self.logger.warning(f"Valor do campo diferente do esperado ({valor_atual} != {numero_processo}), tentando JS")
+            self.driver.execute_script(f"arguments[0].value = '{numero_processo}';", campo_proc)
+            valor_atual = campo_proc.get_attribute('value')
+            if valor_atual != numero_processo:
+                if self.ui:
+                    print(f"{Fore.RED}  ❌ Falha ao preencher campo do processo")
+                self.logger.error("Falha ao preencher corretamente o campo do processo.")
+                return False
+
+        if self.ui:
+            print(f"{Fore.GREEN}  ✅ Campo preenchido: {numero_processo}")
+        self.logger.info(f"Campo preenchido corretamente com: {numero_processo}")
+
+        # Resolve o captcha
+        try:
+            campo_captcha = self.driver.find_element(By.ID, "txtInfraCaptcha")
+        except:
+            if self.ui:
+                print(f"{Fore.RED}  ❌ Campo de captcha não encontrado")
+            self.logger.error("Campo de captcha não encontrado")
+            return False
+            
+        captcha = self.captcha_handler.resolver_captcha()
+        if not captcha:
+            if self.ui:
+                print(f"{Fore.RED}  ❌ Não foi possível resolver captcha")
+            self.logger.error("Não foi possível resolver captcha")
+            return False
+            
+        campo_captcha.clear()
+        campo_captcha.send_keys(captcha)
+
+        # Clica no botão pesquisar
+        try:
+            botao = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.ID, "sbmPesquisar"))
+            )
+            botao.click()
+            if self.ui:
+                print(f"{Fore.CYAN}  🔍 Pesquisando processo...")
+            self.logger.info("Botão Pesquisar clicado")
+            time.sleep(5)
+        except Exception as e:
+            if self.ui:
+                print(f"{Fore.RED}  ❌ Erro ao pesquisar")
+            self.logger.error(f"Erro ao clicar no botão pesquisar: {e}")
+            return False
+
+        # Procura o link do processo nos resultados
+        numero_proc_normalizado = normalizar_numero(numero_processo)
+        links_processo = self.driver.find_elements(By.XPATH, '//a')
+        
+        for link in links_processo:
+            link_texto = link.text.strip()
+            link_texto_normalizado = normalizar_numero(link_texto)
+            if link.is_displayed() and link_texto_normalizado == numero_proc_normalizado:
+                if self.ui:
+                    print(f"{Fore.GREEN}  ✅ Processo encontrado: {link_texto}")
+                self.logger.info(f"Link do processo encontrado: '{link_texto}'")
+                try:
+                    link.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", link)
+                time.sleep(2)
+                
+                # Muda para nova aba se necessário
+                abas = self.driver.window_handles
+                if len(abas) > 1:
+                    self.driver.switch_to.window(abas[-1])
+                return True
+        
+        if self.ui:
+            print(f"{Fore.RED}  ❌ Processo não encontrado nos resultados")
+        self.logger.warning(f"Link do processo {numero_processo} não encontrado na lista de links clicáveis.")
+        return False
+
+    def extrair_detalhes_processo(self) -> Dict[str, str]:
+        """Extrai detalhes básicos do processo"""
+        dados = {}
+        try:
+            tabela = self.driver.find_element(By.ID, "tblCabecalho")
+            linhas = tabela.find_elements(By.TAG_NAME, "tr")
+            
+            for linha in linhas:
+                tds = linha.find_elements(By.TAG_NAME, "td")
+                if len(tds) == 2:
+                    chave = tds[0].text.strip().replace(":", "")
+                    valor = tds[1].text.strip().replace("\n", " ").replace("\r", "")
+
+                    # Tratamento especial para interessados
+                    if chave.lower().startswith("interessado"):
+                        subelementos = tds[1].find_elements(By.XPATH, ".//*")
+                        if subelementos:
+                            lista_interessados = []
+                            for elem in subelementos:
+                                texto = elem.text.strip()
+                                if texto and texto not in lista_interessados:
+                                    lista_interessados.append(texto)
+                            valor = "; ".join(lista_interessados)
+                        if not valor:
+                            valor = linha.text.replace(tds[0].text, "", 1).strip().replace("\n", "; ").replace("\r", "")
+                        dados["Interessados"] = valor
+                    else:
+                        dados[chave] = valor
+
+            # Garantir captura da coluna Interessados
+            if 'Interessados' not in dados or not dados.get('Interessados'):
+                try:
+                    # Procura por qualquer célula que contenha o rótulo de interessados
+                    celula = tabela.find_element(
+                        By.XPATH,
+                        ".//td[contains(translate(normalize-space(), 'INTERESSADO', 'interessado'), 'interessado')]"
+                    )
+                    valor = ""
+                    try:
+                        valor_td = celula.find_element(By.XPATH, "following-sibling::td[1]")
+                        subelementos = valor_td.find_elements(By.XPATH, ".//*")
+                        if subelementos:
+                            lista_interessados = []
+                            for elem in subelementos:
+                                texto = elem.text.strip()
+                                if texto and texto not in lista_interessados:
+                                    lista_interessados.append(texto)
+                            valor = "; ".join(lista_interessados)
+                        else:
+                            valor = valor_td.text.strip().replace("\n", " ").replace("\r", "")
+                    except Exception:
+                        pass
+                    if not valor:
+                        linha = celula.find_element(By.XPATH, "..")
+                        valor = linha.text.replace(celula.text, "", 1).strip().replace("\n", "; ").replace("\r", "")
+                    dados['Interessados'] = valor
+                except Exception as e:
+                    self.logger.error(f"Erro ao extrair interessados: {e}")
+        except Exception as e:
+            self.logger.error(f"Erro ao extrair detalhes do processo: {e}")
+
+        if not dados.get("Interessados"):
+            extra = self.buscar_interessados_redundante()
+            if extra:
+                dados["Interessados"] = extra
+
+        return dados
+
+    def buscar_interessados_redundante(self) -> str:
+        """Busca interessados diretamente no HTML quando a extração padrão falhar."""
+        try:
+            source = self.driver.page_source
+            match = re.search(r"Interessad[oa]s?</td>\s*<td[^>]*>(.*?)</td>", source, re.IGNORECASE | re.DOTALL)
+            if match:
+                texto = re.sub(r"<[^>]+>", "", match.group(1))
+                texto = re.sub(r"\s+", " ", texto).strip()
+                return texto
+        except Exception as e:
+            self.logger.error(f"Erro na busca redundante de interessados: {e}")
+        return ""
+
+    def _extrair_link_documento(self, elem) -> str:
+        """Obtém o link real do documento a partir do elemento de âncora.
+
+        Tenta extrair o link diretamente do ``href`` do elemento. Caso seja uma
+        chamada JavaScript, procura URLs dentro do atributo ``onclick`` e retorna
+        o último link encontrado, que geralmente corresponde ao documento
+        desejado. O URL extraído é unido ao endereço atual da página para formar
+        um link absoluto quando necessário.
+        """
+        try:
+            base_url = self.driver.current_url
+            href = elem.get_attribute("href")
+            if href and not href.lower().startswith("javascript"):
+                return urljoin(base_url, href)
+
+            onclick = elem.get_attribute("onclick") or ""
+            if onclick:
+                candidatos = re.findall(
+                    r"['\"](https?://[^'\"]+|/[^'\"]+|\w+\.php[^'\"]*)['\"]",
+                    onclick,
+                )
+                for url in reversed(candidatos):
+                    if url.lower().startswith("javascript"):
+                        continue
+                    return urljoin(base_url, url)
+        except Exception as e:
+            self.logger.debug(f"Falha ao extrair link de documento: {e}")
+        return ""
+    def extrair_lista_protocolos_concatenado(self) -> Tuple[str, str, str, str, str, str]:
+        """Extrai lista de protocolos/documentos"""
+        try:
+            tabela = self.driver.find_element(By.ID, "tblDocumentos")
+            linhas = tabela.find_elements(By.XPATH, ".//tr")[1:]  # Pula cabeçalho
+
+            doc_nrs, doc_tipos, doc_datas = [], [], []
+            doc_inclusoes, doc_unidades, doc_links = [], [], []
+
+            for linha in linhas:
+                tds = linha.find_elements(By.TAG_NAME, "td")
+                if len(tds) >= 6:
+                    doc_nrs.append(tds[1].text.strip())
+                    doc_tipos.append(tds[2].text.strip())
+                    doc_datas.append(tds[3].text.strip())
+                    doc_inclusoes.append(tds[4].text.strip())
+                    doc_unidades.append(tds[5].text.strip())
+                    try:
+                        link_elem = tds[1].find_element(By.TAG_NAME, "a")
+
+                        doc_links.append(self._extrair_link_documento(link_elem))
+
+                    except Exception:
+                        doc_links.append("")
+
+            return (
+                "\n".join(doc_nrs),
+                "\n".join(doc_tipos),
+                "\n".join(doc_datas),
+                "\n".join(doc_inclusoes),
+                "\n".join(doc_unidades),
+                "\n".join(doc_links),
+            )
+        except Exception as e:
+            self.logger.error(f"Erro ao extrair lista de protocolos: {e}")
+            return "", "", "", "", "", ""
+
+    def extrair_andamentos_concatenado(self) -> Tuple[str, str, str]:
+        """Extrai andamentos do processo"""
+        try:
+            linhas = self.driver.find_elements(By.XPATH, "//tr[contains(@class, 'andamento')]")
+            datas, unidades, descricoes = [], [], []
+            
+            for linha in linhas:
+                tds = linha.find_elements(By.TAG_NAME, "td")
+                if len(tds) == 3:
+                    datas.append(tds[0].text.strip())
+                    unidades.append(tds[1].text.strip())
+                    descricoes.append(tds[2].text.strip())
+            
+            return "\n".join(datas), "\n".join(unidades), "\n".join(descricoes)
+        except Exception as e:
+            self.logger.error(f"Erro ao extrair andamentos: {e}")
+            return "", "", ""
+
+# Continuarei com as outras classes na próxima mensagem devido ao limite de caracteres...
+
+class PlanilhaHandler:
+    """Gerenciador de interação com Google Sheets"""
+    
+    def __init__(self, config: ConfigManager, logger):
+        self.config = config
+        self.logger = logger
+        self.sheet = self._iniciar_sheet()
+    
+    def _iniciar_sheet(self):
+        """Inicializa conexão com Google Sheets"""
+        def _init():
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds_file = self.config.get('google_drive.credentials_file')
+            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
+            client = gspread.authorize(creds)
+            sheet_name = self.config.get('google_drive.sheet_name')
+            worksheet_name = self.config.get('google_drive.worksheet_name')
+            return client.open(sheet_name).worksheet(worksheet_name)
+        
+        return operacao_com_retry(_init, logger=self.logger)
+    
+    def normalizar_numero(self, numero: str) -> str:
+        """Remove caracteres não numéricos"""
+        return re.sub(r"\D", "", numero)
+    
+    def find_row_by_proc_number(self, proc_number: str) -> Optional[int]:
+        """Encontra linha do processo na planilha"""
+        def _find_row():
+            proc_col = self.sheet.col_values(1)
+            proc_number_norm = self.normalizar_numero(proc_number)
+            for idx, val in enumerate(proc_col[1:], start=2):
+                if self.normalizar_numero(val) == proc_number_norm:
+                    return idx
+            return None
+        
+        return operacao_com_retry(_find_row, logger=self.logger)
+    
+    def atualizar_ou_inserir_processo(self, linha: List[str], proc_number: str) -> str:
+        """Atualiza processo existente ou insere novo"""
+        row_idx = self.find_row_by_proc_number(proc_number)
+
+        if row_idx:
+            self.logger.info(f"Atualizando linha {row_idx} para processo {proc_number}")
+            operacao_com_retry(
+                lambda: self.sheet.update(values=[linha], range_name=f"A{row_idx}:L{row_idx}", value_input_option="USER_ENTERED"),
+                logger=self.logger
+            )
+            return "atualizado"
+        else:
+            self.logger.info(f"Inserindo novo processo {proc_number}")
+            operacao_com_retry(lambda: self.sheet.append_row(linha, value_input_option="USER_ENTERED"), logger=self.logger)
+            return "inserido"
+    
+    def get_all_processos(self) -> List[str]:
+        """Obtém todos os números de processo da planilha"""
+        def _get_processos():
+            return self.sheet.col_values(1)[1:]  # Pula cabeçalho
+        
+        return operacao_com_retry(_get_processos, logger=self.logger)
+    
+    def get_all_values(self) -> List[List[str]]:
+        """Obtém todos os valores da planilha"""
+        def _get_values():
+            return self.sheet.get_all_values()
+
+        return operacao_com_retry(_get_values, logger=self.logger)
+
+    def get_cell_value(self, row: int, col: int) -> str:
+        """Obtém valor de uma célula específica"""
+        def _get_cell():
+            return self.sheet.cell(row, col).value
+        return operacao_com_retry(_get_cell, logger=self.logger)
+
+def main() -> List[Dict[str, str]]:
+    """
+    Função principal do script de monitoramento PAINEEL.
+    
+    Returns:
+        Lista com resultados do processamento de cada processo
+    """
+    parser = argparse.ArgumentParser(description='PAINEEL Automation System')
+    
+    # Define default config path baseado no SO
+    if platform.system() == "Windows":
+        default_config = os.path.join(os.getcwd(), "config", "configs.json")
+    else:
+        default_config = '/opt/sei-aneel/config/configs.json'
+    
+    parser.add_argument('--config', default=default_config,
+                       help='Caminho para arquivo de configuração')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Ativa logs detalhados')
+    parser.add_argument('--interactive', action='store_true', default=True,
+                       help='Modo interativo com interface colorida')
+    parser.add_argument('--step-mode', action='store_true',
+                       help='Modo passo-a-passo para debug')
+    parser.add_argument('--max-processes', type=int,
+                       help='Número máximo de processos a processar')
+    parser.add_argument('--processo', nargs='*',
+                       help='Números de processo específicos para consulta')
+    parser.add_argument('--email-tabela', action='store_true',
+                       help='Envia tabela completa por email sem atualizar')
+    args = parser.parse_args()
+    
+    # Inicializa interface interativa
+    ui = InteractiveUI() if args.interactive else None
+    tracker = ProgressTracker()
+    
+    if ui:
+        ui.print_header()
+        ui.step_mode = args.step_mode
+        if ui.step_mode:
+            print(f"{Fore.YELLOW}⚠️  Modo passo-a-passo ativado")
+    
+    # Carrega configurações
+    try:
+        config = ConfigManager(args.config)
+        if ui:
+            print(f"{Fore.GREEN}✅ Configurações carregadas de: {args.config}")
+            config.print_config_summary()
+    except (FileNotFoundError, ValueError) as e:
+        error_msg = f"Erro ao carregar configurações: {e}"
+        if ui:
+            print(f"{Fore.RED}❌ {error_msg}")
+        else:
+            print(error_msg)
+        return []
+    
+    # Configura logging
+    logger_manager = Logger(config)
+    logger = logger_manager.logger
+
+    logger.info("Iniciando script de monitoramento PAINEEL")
+
+    if args.email_tabela:
+        try:
+            planilha_handler = PlanilhaHandler(config, logger)
+            enviar_tabela_completa_email(planilha_handler, config, logger)
+            if ui:
+                print(f"{Fore.GREEN}✅ Tabela enviada por email com sucesso")
+            return []
+        except Exception as e:
+            if ui:
+                print(f"{Fore.RED}❌ Erro ao enviar tabela: {e}")
+            logger.error(f"Erro ao enviar tabela completa: {e}")
+            return []
+
+    # Configura paths
+    paths = configurar_paths(config)
+    
+    # Cria diretórios necessários baseado no SO
+    if platform.system() == "Windows":
+        data_dir = Path(os.getcwd()) / "data"
+    else:
+        data_dir = Path("/opt/sei-aneel/data")
+    
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Valida configurações antes de iniciar
+    if not validar_configuracoes(config, paths, logger):
+        error_msg = "Falha na validação das configurações. Abortando execução."
+        if ui:
+            print(f"\n{Fore.RED}❌ {error_msg}")
+        logger.error(error_msg)
+        return []
+    
+    if ui:
+        print(f"\n{Fore.GREEN}✅ Validação de configurações concluída")
+        ui.print_menu()
+    
+    # Configura Tesseract
+    pytesseract.pytesseract.tesseract_cmd = paths["tesseract"]
+    
+    # Configura Chrome
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    if platform.system() != "Windows":
+        chrome_options.binary_location = paths["chrome_binary"]
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-gpu")
+    
+    keyboard_handler = None
+    try:
+        # Inicializa componentes
+        if ui:
+            print(f"\n{Fore.CYAN}🚀 Inicializando navegador...")
+        service = Service(executable_path=paths["chromedriver"])
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        if ui:
+            print(f"{Fore.GREEN}✅ Navegador inicializado")
+
+        planilha_handler = None
+        if not args.processo:
+            if ui:
+                print(f"{Fore.CYAN}📊 Conectando à planilha Google...")
+            planilha_handler = PlanilhaHandler(config, logger)
+            if ui:
+                print(f"{Fore.GREEN}✅ Planilha conectada")
+
+        if ui:
+            keyboard_handler = KeyboardHandler(ui, tracker)
+            keyboard_handler.setup_signal_handler()
+
+    except Exception as e:
+        error_msg = f"Erro na inicialização: {e}"
+        if ui:
+            print(f"\n{Fore.RED}❌ {error_msg}")
+        logger.error(error_msg)
+        return []
+    
+    resultados = []
+    try:
+        # Obtém processos
+        if args.processo:
+            processos_brutos = args.processo
+        else:
+            if ui:
+                print(f"\n{Fore.CYAN}📋 Obtendo lista de processos...")
+            processos_brutos = planilha_handler.get_all_processos()
+        processos_validos = []
+        
+        for proc in processos_brutos:
+            if validar_numero_processo(proc):
+                processos_validos.append(re.sub(r'\D', '', proc.strip()))
+        
+        processos_unicos = list(set(processos_validos))
+        
+        # Aplica limite se especificado
+        if args.max_processes and args.max_processes > 0:
+            processos_unicos = processos_unicos[:args.max_processes]
+            if ui:
+                print(f"{Fore.YELLOW}⚠️  Limitado a {args.max_processes} processos")
+        
+        if not processos_unicos:
+            error_msg = (
+                "Nenhum número de processo válido fornecido!"
+                if args.processo
+                else "Nenhum número de processo válido encontrado na planilha!"
+            )
+            if ui:
+                print(f"\n{Fore.RED}❌ {error_msg}")
+            logger.error(f"ERRO: {error_msg}")
+            return []
+        
+        if ui:
+            print(f"{Fore.GREEN}✅ {len(processos_unicos)} processos válidos encontrados")
+        
+        logger.info(f"Total de {len(processos_unicos)} processos válidos para processar")
+        if len(processos_unicos) >= 5:
+            logger.info(f"Primeiros 5 processos: {', '.join(processos_unicos[:5])}...")
+        else:
+            logger.info(f"Processos: {', '.join(processos_unicos)}")
+        
+        # Configurações de execução
+        max_execution_time = config.get('execution.max_execution_time', 1800)
+        max_retry_attempts = config.get('execution.max_retry_attempts', 3)
+        
+        tempo_inicio = datetime.now()
+        tempo_limite = tempo_inicio + timedelta(seconds=max_execution_time)
+        
+        processos_falha = set()
+        
+        # Inicia rastreamento
+        tracker.start(len(processos_unicos))
+        
+        if ui:
+            print(f"\n{Fore.CYAN}🔄 Iniciando processamento...")
+            print(f"{Fore.WHITE}Tempo limite: {tempo_limite.strftime('%H:%M:%S')}")
+            print(f"{Fore.WHITE}ETA inicial: {tracker.get_eta()}")
+        
+        # Processa cada processo
+        for i, proc in enumerate(processos_unicos):
+            if ui:
+                ui.handle_pause()
+                
+            if datetime.now() >= tempo_limite:
+                if ui:
+                    print(f"\n\n{Fore.YELLOW}⏰ Tempo máximo de execução atingido.")
+                logger.warning("Tempo máximo de execução atingido.")
+                break
+            
+            if ui:
+                ui.print_status(i+1, len(processos_unicos), proc, "processando")
+                ui.wait_for_input()
+            
+            logger.info(f"Processando {i+1}/{len(processos_unicos)}: {proc}")
+            resultado = processar_processo(proc, driver, planilha_handler, config, logger, ui)
+            resultados.append(resultado)
+            tracker.update_stats(resultado["status"])
+            
+            if ui:
+                status_color = "sucesso" if resultado["status"] in ["atualizado", "inserido", "processado"] else "falha"
+                ui.print_status(i+1, len(processos_unicos), proc, status_color)
+                print(f"\n{Fore.WHITE}ETA: {tracker.get_eta()}")
+            
+            if resultado["status"] == "falha":
+                processos_falha.add(proc)
+        
+        # Retry para processos que falharam
+        for tentativa in range(2, max_retry_attempts + 1):
+            if not processos_falha or datetime.now() >= tempo_limite:
+                break
+            
+            if ui:
+                print(f"\n\n{Fore.YELLOW}🔄 Tentativa {tentativa} para processos não atualizados ({len(processos_falha)} processos)...")
+            logger.info(f"Iniciando tentativa {tentativa} para processos não atualizados...")
+            novos_falha = set()
+            
+            for j, proc in enumerate(list(processos_falha)):
+                if ui:
+                    ui.handle_pause()
+                    
+                if datetime.now() >= tempo_limite:
+                    if ui:
+                        print(f"\n{Fore.YELLOW}⏰ Tempo máximo atingido durante tentativas de repetição.")
+                    logger.warning("Tempo máximo atingido durante tentativas de repetição.")
+                    break
+                
+                if ui:
+                    ui.print_status(j+1, len(processos_falha), proc, "reprocessando")
+                
+                resultado = processar_processo(proc, driver, planilha_handler, config, logger, ui)
+                resultados.append(resultado)
+                tracker.update_stats(resultado["status"])
+                
+                if resultado["status"] == "falha":
+                    novos_falha.add(proc)
+                else:
+                    processos_falha.discard(proc)
+            
+            processos_falha = novos_falha
+        
+        # Verifica mudanças e envia email se configurado
+        if get_recipients(config, 'sei'):
+            if args.processo:
+                if ui:
+                    print(f"\n\n{Fore.CYAN}📧 Enviando resultados por email...")
+                enviar_resultados_email(resultados, config, logger)
+                if ui:
+                    print(f"{Fore.GREEN}✅ Email enviado")
+            else:
+                if ui:
+                    print(f"\n\n{Fore.CYAN}📧 Verificando mudanças e enviando notificações...")
+                verificar_e_enviar_notificacoes(planilha_handler, list(processos_falha), config, logger)
+                if ui:
+                    print(f"{Fore.GREEN}✅ Notificações processadas")
+        
+        if ui:
+            print(f"\n\n{Fore.GREEN}🎉 Processamento finalizado com sucesso!")
+            tracker.print_summary()
+        logger.info("Processamento finalizado com sucesso.")
+        
+    except KeyboardInterrupt:
+        if ui:
+            print(f"\n\n{Fore.YELLOW}⏹️  Execução interrompida pelo usuário.")
+        logger.info("Execução interrompida pelo usuário.")
+    except Exception as e:
+        if ui:
+            print(f"\n\n{Fore.RED}❌ Erro durante processamento: {e}")
+        logger.error(f"Erro durante processamento: {e}")
+    finally:
+        if keyboard_handler:
+            keyboard_handler.restore_signal_handler()
+        driver.quit()
+        if ui:
+            print(f"\n{Fore.CYAN}🔚 Recursos liberados. Obrigado por usar o PAINEEL!")
+    
+    return resultados
+
+def processar_processo(proc: str, driver, planilha_handler: Optional[PlanilhaHandler],
+                      config: ConfigManager, logger, ui: InteractiveUI = None) -> Dict[str, Any]:
+    """Processa um processo individual"""
+    if not validar_numero_processo(proc):
+        if ui:
+            print(f"{Fore.RED}  ❌ Processo inválido: {proc}")
+        logger.warning(f"Ignorando processo inválido: '{proc}'")
+        return {"processo": proc, "status": "invalido"}
+    
+    if ui:
+        print(f"\n{Fore.CYAN}📋 Processando: {Fore.WHITE}{proc}")
+    logger.info(f"Processando: {proc}")
+    sei = SEIAneel(driver, config, logger, ui)
+    
+    try:
+        sucesso = sei.pesquisar_e_entrar_processo(proc)
+        if not sucesso:
+            if ui:
+                print(f"{Fore.RED}  ❌ Falha ao acessar processo")
+            logger.warning(f"Processo {proc} pulado após falha.")
+            return {"processo": proc, "status": "falha"}
+        
+        if ui:
+            print(f"{Fore.CYAN}  📄 Extraindo detalhes...")
+        detalhes = sei.extrair_detalhes_processo()
+        doc_nr, doc_tipo, doc_data, doc_incl, doc_uni, doc_links = sei.extrair_lista_protocolos_concatenado()
+        doc_nr_list = doc_nr.split("\n") if doc_nr else []
+        doc_link_list = doc_links.split("\n") if doc_links else []
+
+        if planilha_handler:
+            doc_formula_parts = []
+            for texto, link in zip_longest(doc_nr_list, doc_link_list, fillvalue=""):
+                texto_safe = texto.replace('"', '\\"')
+                if link:
+                    link_safe = link.replace('"', '\\"')
+                    # Usa ';' para compatibilidade com locale PT-BR nas fórmulas
+                    doc_formula_parts.append(f'HYPERLINK("{link_safe}"; "{texto_safe}")')
+                else:
+                    doc_formula_parts.append(f'"{texto_safe}"')
+            doc_nr = "=" + "&CHAR(10)&".join(doc_formula_parts) if doc_formula_parts else ""
+        else:
+            doc_nr = "\n".join(doc_nr_list)
+        and_datas, and_unids, and_descrs = sei.extrair_andamentos_concatenado()
+
+        interessados = detalhes.get("Interessados", "")
+        if not interessados:
+            interessados = sei.buscar_interessados_redundante()
+
+        linha = [
+            detalhes.get("Processo", ""),
+            detalhes.get("Tipo", ""),
+            interessados,
+            doc_nr,
+            doc_tipo,
+            doc_data,
+            doc_incl,
+            doc_uni,
+            and_datas,
+            and_unids,
+            and_descrs,
+            doc_links,
+        ]
+
+        status = "processado"
+        if planilha_handler:
+            if ui:
+                print(f"{Fore.CYAN}  💾 Salvando na planilha...")
+            status_inicial = None
+            col_c_val = ""
+            for tentativa in range(2):
+                status_atual = planilha_handler.atualizar_ou_inserir_processo(linha, detalhes.get("Processo", ""))
+                if status_inicial is None:
+                    status_inicial = status_atual
+                row_idx = planilha_handler.find_row_by_proc_number(detalhes.get("Processo", ""))
+                if row_idx:
+                    valor = planilha_handler.get_cell_value(row_idx, 3)
+                    if valor and valor.strip():
+                        col_c_val = valor
+                        break
+                if tentativa == 0:
+                    logger.warning(f"Coluna C vazia para {detalhes.get('Processo','')}, tentando novamente...")
+            if not col_c_val:
+                logger.warning(f"Coluna C permaneceu vazia para {detalhes.get('Processo','')} após 2 tentativas.")
+            status = status_inicial if status_inicial else status_atual
+
+        sei.captcha_handler.limpar_captchas()
+
+        status_msg = (
+            "✅ Atualizado" if status == "atualizado" else
+            "📝 Inserido" if status == "inserido" else
+            "✅ Processado" if status == "processado" else
+            "❌ Falha"
+        )
+        status_color = Fore.GREEN if status in ["atualizado", "inserido", "processado"] else Fore.RED
+
+        if ui:
+            print(f"{status_color}  {status_msg}")
+
+        return {"processo": detalhes.get("Processo", ""), "status": status, "dados": linha}
+    except Exception as e:
+        if ui:
+            print(f"{Fore.RED}  ❌ Erro: {str(e)[:50]}...")
+        logger.error(f"Erro ao processar {proc}: {e}")
+        return {"processo": proc, "status": "falha"}
+    finally:
+        try:
+            driver.delete_all_cookies()
+        except:
+            pass
+
+def verificar_e_enviar_notificacoes(planilha_handler: PlanilhaHandler, 
+                                   processos_falha: List[str], 
+                                   config: ConfigManager, logger):
+    """Verifica mudanças e envia notificações por email"""
+    try:
+        # Carrega snapshot anterior se existir - ajusta path baseado no SO
+        if platform.system() == "Windows":
+            snapshot_path = Path(os.getcwd()) / "data" / "snapshot.json"
+        else:
+            snapshot_path = Path("/opt/sei-aneel/data/snapshot.json")
+        
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        snapshot_anterior = {}
+        if snapshot_path.exists():
+            try:
+                # Ignore undecodable bytes so installations with different
+                # locale settings do not crash when reading the snapshot file.
+                with open(snapshot_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    snapshot_anterior = json.load(f)
+                logger.info("Snapshot anterior carregado")
+            except Exception as e:
+                logger.warning(f"Erro ao carregar snapshot anterior: {e}")
+        
+        # Obtém dados atuais da planilha
+        dados_atuais = planilha_handler.get_all_values()
+        if not dados_atuais:
+            logger.warning("Nenhum dado obtido da planilha")
+            return
+        
+        cabecalho = dados_atuais[0]
+        linhas_dados = dados_atuais[1:]
+        
+        # Cria snapshot atual
+        snapshot_atual = {}
+        mudancas_detectadas = []
+        
+        for linha in linhas_dados:
+            if not linha or not linha[0]:  # Pula linhas vazias
+                continue
+                
+            numero_processo = normalizar_numero(linha[0])
+            if not numero_processo:
+                continue
+            
+            # Dados relevantes para comparação (exclui timestamps que mudam sempre)
+            dados_processo = {
+                'tipo': (linha[1] if len(linha) > 1 else '').strip(),
+                'interessados': (linha[2] if len(linha) > 2 else '').strip(),
+                'documentos_nr': (linha[3] if len(linha) > 3 else '').strip(),
+                'documentos_tipo': (linha[4] if len(linha) > 4 else '').strip(),
+                'andamentos_data': (linha[8] if len(linha) > 8 else '').strip(),
+                'andamentos_descricao': (linha[10] if len(linha) > 10 else '').strip()
+            }
+            
+            snapshot_atual[numero_processo] = dados_processo
+            
+            # Verifica mudanças
+            if numero_processo in snapshot_anterior:
+                dados_anteriores = snapshot_anterior[numero_processo]
+                
+                # Compara andamentos (principal indicador de mudança)
+                if dados_processo['andamentos_descricao'] != dados_anteriores.get('andamentos_descricao', ''):
+                    mudancas_detectadas.append({
+                        'processo': linha[0],
+                        'tipo_mudanca': 'andamento',
+                        'descricao': 'Novos andamentos detectados',
+                        'dados_linha': dict(zip(cabecalho, linha))
+                    })
+                    logger.info(f"Mudança de andamento detectada no processo {linha[0]}")
+
+                # Compara documentos
+                elif dados_processo['documentos_nr'] != dados_anteriores.get('documentos_nr', ''):
+                    mudancas_detectadas.append({
+                        'processo': linha[0],
+                        'tipo_mudanca': 'documento',
+                        'descricao': 'Novos documentos detectados',
+                        'dados_linha': dict(zip(cabecalho, linha))
+                    })
+                    logger.info(f"Mudança de documento detectada no processo {linha[0]}")
+            else:
+                # Processo novo
+                mudancas_detectadas.append({
+                    'processo': linha[0],
+                    'tipo_mudanca': 'novo',
+                    'descricao': 'Processo adicionado ao monitoramento',
+                    'dados_linha': dict(zip(cabecalho, linha))
+                })
+                logger.info(f"Novo processo detectado: {linha[0]}")
+        
+        # Salva snapshot atual
+        try:
+            with open(snapshot_path, 'w', encoding='utf-8') as f:
+                json.dump(snapshot_atual, f, ensure_ascii=False, indent=2)
+            logger.info("Snapshot atual salvo")
+        except Exception as e:
+            logger.error(f"Erro ao salvar snapshot: {e}")
+        
+        hash_path = Path("/opt/sei-aneel/data/last_hash.txt")
+        current_hash = hash_content([json.dumps(snapshot_atual, sort_keys=True)])
+        last_hash = hash_path.read_text().strip() if hash_path.exists() else ""
+        if current_hash != last_hash or processos_falha:
+            enviar_notificacao_email(planilha_handler, mudancas_detectadas, processos_falha, config, logger)
+            try:
+                hash_path.parent.mkdir(parents=True, exist_ok=True)
+                hash_path.write_text(current_hash)
+            except Exception as e:
+                logger.warning(f"Não foi possível salvar hash: {e}")
+        else:
+            logger.info("Resultados sem mudanças, email não enviado")
+            
+    except Exception as e:
+        logger.error(f"Erro na verificação de mudanças: {e}")
+
+def enviar_notificacao_email(planilha_handler: PlanilhaHandler,
+                           mudancas: List[Dict], processos_falha: List[str],
+                           config: ConfigManager, logger):
+    """Envia email de notificação sobre mudanças detectadas"""
+    try:
+        smtp_config = config.get('smtp', {})
+        recipients = get_recipients(config, 'sei')
+
+        if not all([smtp_config.get('server'), smtp_config.get('user'),
+                   smtp_config.get('password'), recipients]):
+            logger.warning("Configurações de email incompletas, pulando envio")
+            return
+
+        if not mudancas and not processos_falha:
+            logger.info("Nenhuma mudança ou falha para notificar, email não enviado")
+            return
+
+        def organizar_colunas(dados: Dict[str, str], campos: List[str], chave_ord: str) -> Dict[str, str]:
+            listas = {c: [s.strip() for s in dados.get(c, '').splitlines() if s.strip()] for c in campos}
+            total = max((len(v) for v in listas.values()), default=0)
+            registros = []
+            for i in range(total):
+                registros.append({c: listas[c][i] if i < len(listas[c]) else '' for c in campos})
+
+            def parse_data(valor: str):
+                for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d/%m/%Y'):
+                    try:
+                        return datetime.strptime(valor, fmt)
+                    except ValueError:
+                        continue
+                return datetime.min
+
+            registros.sort(key=lambda r: parse_data(r.get(chave_ord, '')), reverse=True)
+            return {c: '<br>'.join(r[c] for r in registros if r[c]) for c in campos}
+
+        # Prepara conteúdo do email
+        assunto = f"PAINEEL - Relatório de Monitoramento ({datetime.now().strftime('%d/%m/%Y %H:%M')})"
+        
+        timestamp_str = datetime.now().strftime('%d/%m/%Y às %H:%M:%S')
+        corpo_html = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .header {{ color: #2c5aa0; border-bottom: 2px solid #2c5aa0; padding-bottom: 10px; }}
+                .section {{ margin: 20px 0; }}
+                .mudanca {{ background-color: #e8f4f8; border-left: 4px solid #2c5aa0; padding: 10px; margin: 5px 0; }}
+                .falha {{ background-color: #f8e8e8; border-left: 4px solid #d32f2f; padding: 10px; margin: 5px 0; }}
+                .processo {{ font-weight: bold; color: #1976d2; }}
+                .tipo {{ color: #666; font-style: italic; }}
+                .timestamp {{ color: #888; font-size: 0.9em; }}
+                table.detalhes {{ border-collapse: collapse; margin-top: 5px; }}
+                table.detalhes th, table.detalhes td {{ border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; font-size: 0.9em; }}
+                table.detalhes th {{ background-color: #f0f0f0; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>Relatório de Monitoramento PAINEEL</h2>
+                <div class="timestamp">Gerado em: {timestamp_str}</div>
+            </div>
+        """
+        
+        if mudancas:
+            corpo_html += f"""
+            <div class="section">
+                <h3>📋 Mudanças Detectadas ({len(mudancas)})</h3>
+            """
+            
+            for mudanca in mudancas:
+                icone = "🔄" if mudanca['tipo_mudanca'] == 'andamento' else "📄" if mudanca['tipo_mudanca'] == 'documento' else "🆕"
+                detalhes_html = ""
+                dados = mudanca.get('dados_linha', {})
+                if dados:
+                    linhas = [
+                        f"<tr><th>PROCESSOS</th><td>{mudanca['processo']}</td></tr>",
+                        f"<tr><th>Tipo do processo</th><td>{dados.get('Tipo do processo', '')}</td></tr>",
+                        f"<tr><th>Interessados</th><td>{dados.get('Interessados', '')}</td></tr>",
+                    ]
+                    
+                    tabela_basica = f"<table class=\"detalhes\">{''.join(linhas)}</table>"
+                    doc_campos = ['Documento', 'Tipo do documento', 'Data do documento', 'Data de Inclusão', 'Unidade', 'Link']
+                    and_campos = ['Data/Hora do Andamento', 'Unidade do Andamento', 'Descrição do Andamento']
+                    docs = organizar_colunas(dados, doc_campos, 'Data de Inclusão')
+                    andamentos = organizar_colunas(dados, and_campos, 'Data/Hora do Andamento')
+                    doc_textos = docs.get('Documento', '').split('<br>') if docs.get('Documento') else []
+                    doc_links = docs.get('Link', '').split('<br>') if docs.get('Link') else []
+                    doc_anchors = []
+                    for texto, link in zip_longest(doc_textos, doc_links, fillvalue=''):
+                        texto_esc = html.escape(texto)
+                        link_esc = html.escape(link, quote=True)
+                        doc_anchors.append(f'<a href="{link_esc}">{texto_esc}</a>' if link else texto_esc)
+                    docs_html = '<br>'.join(doc_anchors)
+                    tabela_colunas = f"""
+                    <table class=\"detalhes\">
+                        <tr>
+                            <th>Documento</th><th>Tipo do documento</th><th>Data do documento</th>
+                            <th>Data de Inclusão</th><th>Unidade</th>
+                            <th>Data/Hora do Andamento</th><th>Unidade do Andamento</th><th>Descrição do Andamento</th>
+                        </tr>
+                        <tr>
+                            <td>{docs_html}</td>
+                            <td>{docs.get('Tipo do documento', '')}</td>
+                            <td>{docs.get('Data do documento', '')}</td>
+                            <td>{docs.get('Data de Inclusão', '')}</td>
+                            <td>{docs.get('Unidade', '')}</td>
+                            <td>{andamentos.get('Data/Hora do Andamento', '')}</td>
+                            <td>{andamentos.get('Unidade do Andamento', '')}</td>
+                            <td>{andamentos.get('Descrição do Andamento', '')}</td>
+                        </tr>
+                    </table>
+                    """
+                    detalhes_html = tabela_basica + tabela_colunas
+                corpo_html += f"""
+                <div class="mudanca">
+                    {icone} <span class="processo">{mudanca['processo']}</span><br>
+                    <span class="tipo">{mudanca['tipo_mudanca'].title()}: {mudanca['descricao']}</span>
+                    {detalhes_html}
+                </div>
+                """
+            corpo_html += "</div>"
+        
+        if processos_falha:
+            corpo_html += f"""
+            <div class="section">
+                <h3>⚠️ Processos com erro ou não localizados ({len(processos_falha)})</h3>
+            """
+            for processo in processos_falha:
+                corpo_html += f"""
+                <div class="falha">
+                    ❌ <span class="processo">{processo}</span><br>
+                    <span class="tipo">Erro no processamento ou processo não localizado - requer atenção manual</span>
+                </div>
+                """
+            corpo_html += "</div>"
+        
+        corpo_html += """
+            <div class="section">
+                <p><small>Este é um e-mail automático do Sistema PAINEEL - Monitoramento de Processos, Pautas e Sorteios - Desenvolvido por AASN.</small></p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Configura e envia email
+        if not recipients:
+            logger.warning("Nenhum destinatário de email configurado, pulando envio")
+            return
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = assunto
+        msg['From'] = smtp_config['user']
+        msg['To'] = ', '.join(recipients)
+        msg['Date'] = formatdate(localtime=True)
+
+        # Adiciona versão texto simples e HTML
+        parte_texto = MIMEText(
+            'Relatório de Monitoramento PAINEEL. Utilize um cliente compatível com HTML para melhor visualização.',
+            'plain', 'utf-8')
+        msg.attach(parte_texto)
+        parte_html = MIMEText(corpo_html, 'html', 'utf-8')
+        msg.attach(parte_html)
+
+        pdf_bytes = gerar_pdf_html(corpo_html, logger)
+        if pdf_bytes:
+            attach_bytes(msg, pdf_bytes, 'notificacao.pdf', 'application', 'pdf')
+
+        try:
+            dados = planilha_handler.get_all_values()
+            headers = dados[0] if dados else []
+            rows = []
+            for mudanca in mudancas:
+                dl = mudanca.get('dados_linha', {})
+                rows.append([dl.get(h, '') for h in headers])
+            xlsx_data = create_xlsx(headers, rows)
+            attach_bytes(
+                msg,
+                xlsx_data,
+                'processos.xlsx',
+                'application',
+                'vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+        except Exception as e:
+            logger.warning(f"Falha ao gerar planilha XLSX: {e}")
+
+        # Envia email
+        server = smtplib.SMTP(smtp_config['server'], smtp_config.get('port', 587))
+        server.ehlo()
+        if smtp_config.get('starttls', False):
+            server.starttls()
+            server.ehlo()
+        server.login(smtp_config['user'], smtp_config['password'])
+        server.send_message(msg)
+        server.quit()
+
+        logger.info(f"Email de notificação enviado para {len(recipients)} destinatário(s)")
+
+    except Exception as e:
+        logger.error(f"Erro ao enviar email de notificação: {e}")
+
+
+def gerar_pdf_html(html_content: str, logger) -> Optional[bytes]:
+    """Gera PDF em orientação paisagem a partir de conteúdo HTML."""
+    try:
+        if not shutil.which("wkhtmltopdf"):
+            logger.warning(
+                "wkhtmltopdf não encontrado. Instale o pacote wkhtmltopdf para gerar PDFs."
+            )
+            return None
+        env = os.environ.copy()
+        env.setdefault("XDG_RUNTIME_DIR", "/tmp")
+        result = subprocess.run(
+            [
+                "wkhtmltopdf",
+                "--quiet",
+                "--orientation",
+                "Landscape",
+                "--print-media-type",
+                "--load-error-handling",
+                "ignore",
+                "-",
+                "-",
+            ],
+            input=html_content.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Falha ao gerar PDF (wkhtmltopdf): {result.stderr.decode()}"
+            )
+            return None
+        if not result.stdout.startswith(b"%PDF"):
+            logger.warning("Conteúdo retornado não é um PDF válido")
+            return None
+        return result.stdout
+    except Exception as e:
+        logger.warning(f"Erro ao gerar PDF: {e}")
+        return None
+
+
+def enviar_resultados_email(resultados: List[Dict[str, Any]],
+                            config: ConfigManager, logger) -> None:
+    """Envia por email os dados dos processos informados"""
+    try:
+        smtp_config = config.get('smtp', {})
+        recipients = get_recipients(config, 'sei')
+
+        if not all([
+            smtp_config.get('server'),
+            smtp_config.get('user'),
+            smtp_config.get('password'),
+            recipients
+        ]):
+            logger.warning("Configurações de email incompletas, pulando envio")
+            return
+
+        assunto = f"PAINEEL - Resultado da Consulta ({datetime.now().strftime('%d/%m/%Y %H:%M')})"
+        timestamp_str = datetime.now().strftime('%d/%m/%Y às %H:%M:%S')
+
+        sucessos = [r for r in resultados if r.get('status') not in ('falha', 'invalido')]
+        falhas = [r.get('processo', '') for r in resultados if r.get('status') == 'falha']
+
+        corpo_html = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .header {{ color: #2c5aa0; border-bottom: 2px solid #2c5aa0; padding-bottom: 10px; }}
+                .section {{ margin: 20px 0; }}
+                .mudanca {{ background-color: #e8f4f8; border-left: 4px solid #2c5aa0; padding: 10px; margin: 5px 0; }}
+                .falha {{ background-color: #f8e8e8; border-left: 4px solid #d32f2f; padding: 10px; margin: 5px 0; }}
+                .processo {{ font-weight: bold; color: #1976d2; }}
+                .tipo {{ color: #666; font-style: italic; }}
+                .timestamp {{ color: #888; font-size: 0.9em; }}
+                table.detalhes {{ border-collapse: collapse; margin-top: 5px; }}
+                table.detalhes th, table.detalhes td {{ border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; font-size: 0.9em; }}
+                table.detalhes th {{ background-color: #f0f0f0; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>Relatório de Monitoramento PAINEEL</h2>
+                <div class="timestamp">Gerado em: {timestamp_str}</div>
+            </div>
+        """
+
+        if sucessos:
+            corpo_html += f"""
+            <div class="section">
+                <h3>📋 Resultados da Consulta ({len(sucessos)})</h3>
+            """
+            for res in sucessos:
+                dados = res.get('dados')
+                if not dados:
+                    continue
+
+                dados_dict = {
+                    "Processo": dados[0],
+                    "Tipo do processo": dados[1],
+                    "Interessados": dados[2],
+                    "Documento": dados[3],
+                    "Tipo do documento": dados[4],
+                    "Data do documento": dados[5],
+                    "Data de Inclusão": dados[6],
+                    "Unidade": dados[7],
+                    "Data/Hora do Andamento": dados[8],
+                    "Unidade do Andamento": dados[9],
+                    "Descrição do Andamento": dados[10],
+                    "Link": dados[11],
+                }
+
+                def organizar_colunas(dados: Dict[str, str], campos: List[str], chave_ord: str) -> Dict[str, str]:
+                    listas = {c: [s.strip() for s in dados.get(c, '').splitlines() if s.strip()] for c in campos}
+                    total = max((len(v) for v in listas.values()), default=0)
+                    registros = []
+                    for i in range(total):
+                        registros.append({c: listas[c][i] if i < len(listas[c]) else '' for c in campos})
+
+                    def parse_data(valor: str):
+                        for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d/%m/%Y'):
+                            try:
+                                return datetime.strptime(valor, fmt)
+                            except ValueError:
+                                continue
+                        return datetime.min
+
+                    registros.sort(key=lambda r: parse_data(r.get(chave_ord, '')), reverse=True)
+                    return {c: '<br>'.join(r[c] for r in registros if r[c]) for c in campos}
+
+                doc_campos = ['Documento', 'Tipo do documento', 'Data do documento', 'Data de Inclusão', 'Unidade', 'Link']
+                and_campos = ['Data/Hora do Andamento', 'Unidade do Andamento', 'Descrição do Andamento']
+                docs = organizar_colunas(dados_dict, doc_campos, 'Data de Inclusão')
+                andamentos = organizar_colunas(dados_dict, and_campos, 'Data/Hora do Andamento')
+
+                doc_textos = docs.get('Documento', '').split('<br>') if docs.get('Documento') else []
+                doc_links = docs.get('Link', '').split('<br>') if docs.get('Link') else []
+                doc_anchors = []
+                for texto, link in zip_longest(doc_textos, doc_links, fillvalue=''):
+                    texto_esc = html.escape(texto)
+                    link_esc = html.escape(link, quote=True)
+                    doc_anchors.append(f'<a href="{link_esc}">{texto_esc}</a>' if link else texto_esc)
+                docs_html = '<br>'.join(doc_anchors)
+
+                tabela_basica = f"""
+                <table class="detalhes">
+                    <tr><th>PROCESSOS</th><td>{html.escape(dados_dict.get('Processo', ''))}</td></tr>
+                    <tr><th>Tipo do processo</th><td>{html.escape(dados_dict.get('Tipo do processo', ''))}</td></tr>
+                    <tr><th>Interessados</th><td>{html.escape(dados_dict.get('Interessados', ''))}</td></tr>
+                </table>
+                """
+
+                tabela_colunas = f"""
+                <table class="detalhes">
+                    <tr>
+                        <th>Documento</th><th>Tipo do documento</th><th>Data do documento</th>
+                        <th>Data de Inclusão</th><th>Unidade</th>
+                        <th>Data/Hora do Andamento</th><th>Unidade do Andamento</th><th>Descrição do Andamento</th>
+                    </tr>
+                    <tr>
+                        <td>{docs_html}</td>
+                        <td>{docs.get('Tipo do documento', '')}</td>
+                        <td>{docs.get('Data do documento', '')}</td>
+                        <td>{docs.get('Data de Inclusão', '')}</td>
+                        <td>{docs.get('Unidade', '')}</td>
+                        <td>{andamentos.get('Data/Hora do Andamento', '')}</td>
+                        <td>{andamentos.get('Unidade do Andamento', '')}</td>
+                        <td>{andamentos.get('Descrição do Andamento', '')}</td>
+                    </tr>
+                </table>
+                """
+
+                corpo_html += f"""
+                <div class="mudanca">
+                    📄 <span class="processo">{html.escape(dados_dict.get('Processo', ''))}</span><br>
+                    <span class="tipo">Resultado da consulta</span>
+                    {tabela_basica + tabela_colunas}
+                </div>
+                """
+
+            corpo_html += "</div>"
+
+        if falhas:
+            corpo_html += f"""
+            <div class="section">
+                <h3>⚠️ Processos com erro ou não localizados ({len(falhas)})</h3>
+            """
+            for processo in falhas:
+                corpo_html += f"""
+                <div class="falha">
+                    ❌ <span class="processo">{processo}</span><br>
+                    <span class="tipo">Erro no processamento ou processo não localizado - requer atenção manual</span>
+                </div>
+                """
+            corpo_html += "</div>"
+
+        corpo_html += """
+            <div class="section">
+                <p><small>Este é um e-mail automático do Sistema PAINEEL - Monitoramento de Processos, Pautas e Sorteios - Desenvolvido por AASN.</small></p>
+            </div>
+        </body>
+        </html>
+        """
+
+        if not recipients:
+            logger.warning("Nenhum destinatário de email configurado, pulando envio")
+            return
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = assunto
+        msg['From'] = smtp_config['user']
+        msg['To'] = ', '.join(recipients)
+        msg['Date'] = formatdate(localtime=True)
+
+        parte_texto = MIMEText(
+            'Resultados da consulta PAINEEL. Utilize um cliente compatível com HTML para melhor visualização.',
+            'plain', 'utf-8')
+        msg.attach(parte_texto)
+        parte_html = MIMEText(corpo_html, 'html', 'utf-8')
+        msg.attach(parte_html)
+
+        pdf_bytes = gerar_pdf_html(corpo_html, logger)
+        if pdf_bytes:
+            attach_bytes(msg, pdf_bytes, 'resultados.pdf', 'application', 'pdf')
+
+        headers = ['Processo', 'Status', 'Mensagem']
+        rows = [[r.get('processo', ''), r.get('status', ''), r.get('mensagem', '')] for r in resultados]
+        xlsx_data = create_xlsx(headers, rows)
+        attach_bytes(
+            msg,
+            xlsx_data,
+            'processos.xlsx',
+            'application',
+            'vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
+        server = smtplib.SMTP(smtp_config['server'], smtp_config.get('port', 587))
+        server.ehlo()
+        if smtp_config.get('starttls', False):
+            server.starttls()
+            server.ehlo()
+        server.login(smtp_config['user'], smtp_config['password'])
+        server.send_message(msg)
+        server.quit()
+
+        logger.info(f"Email de resultados enviado para {len(recipients)} destinatário(s)")
+
+    except Exception as e:
+        logger.error(f"Erro ao enviar email de resultados: {e}")
+
+
+def enviar_tabela_completa_email(planilha_handler: PlanilhaHandler,
+                                 config: ConfigManager, logger) -> None:
+    """Envia por email a tabela completa sem realizar atualização"""
+    try:
+        smtp_config = config.get('smtp', {})
+        recipients = get_recipients(config, 'sei')
+
+        if not all([
+            smtp_config.get('server'),
+            smtp_config.get('user'),
+            smtp_config.get('password'),
+            recipients
+        ]):
+            logger.warning("Configurações de email incompletas, pulando envio")
+            return
+
+        dados = planilha_handler.get_all_values()
+        if not dados:
+            logger.warning("Nenhum dado obtido da planilha")
+            return
+
+        cabecalho = dados[0]
+        linhas = dados[1:]
+
+        assunto = (
+            f"PAINEEL - Tabela Completa ({datetime.now().strftime('%d/%m/%Y %H:%M')})"
+        )
+        timestamp_str = datetime.now().strftime('%d/%m/%Y às %H:%M:%S')
+
+        cab_html = ''.join(f'<th>{html.escape(c)}</th>' for c in cabecalho)
+        linhas_html = ''
+        doc_idx = cabecalho.index('Documento') if 'Documento' in cabecalho else None
+        link_idx = cabecalho.index('Link') if 'Link' in cabecalho else None
+        for linha in linhas:
+            linha_html = ''
+            for idx, col in enumerate(linha):
+                if doc_idx is not None and idx == doc_idx and link_idx is not None and link_idx < len(linha) and linha[link_idx]:
+                    texto_esc = html.escape(col)
+                    link_esc = html.escape(linha[link_idx], quote=True)
+                    linha_html += f'<td><a href="{link_esc}">{texto_esc}</a></td>'
+                elif link_idx is not None and idx == link_idx and col:
+                    link_esc = html.escape(col, quote=True)
+                    linha_html += f'<td><a href="{link_esc}">{link_esc}</a></td>'
+                else:
+                    linha_html += f'<td>{html.escape(col)}</td>'
+            linhas_html += f'<tr>{linha_html}</tr>'
+
+        corpo_html = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .header {{ color: #2c5aa0; border-bottom: 2px solid #2c5aa0; padding-bottom: 10px; }}
+                .section {{ margin: 20px 0; }}
+                table.detalhes {{ border-collapse: collapse; width: 100%; }}
+                table.detalhes th, table.detalhes td {{ border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; font-size: 0.9em; }}
+                table.detalhes th {{ background-color: #f0f0f0; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>Relatório de Monitoramento PAINEEL</h2>
+                <div class="timestamp">Gerado em: {timestamp_str}</div>
+            </div>
+            <div class="section">
+                <h3>📋 Tabela Completa</h3>
+                <table class="detalhes">
+                    <tr>{cab_html}</tr>
+                    {linhas_html}
+                </table>
+            </div>
+            <div class="section">
+                <p><small>Este é um e-mail automático do Sistema PAINEEL - Monitoramento de Processos, Pautas e Sorteios - Desenvolvido por AASN.</small></p>
+            </div>
+        </body>
+        </html>
+        """
+
+        if not recipients:
+            logger.warning("Nenhum destinatário de email configurado, pulando envio")
+            return
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = assunto
+        msg['From'] = smtp_config['user']
+        msg['To'] = ', '.join(recipients)
+        msg['Date'] = formatdate(localtime=True)
+
+        parte_texto = MIMEText(
+            'Tabela completa dos processos PAINEEL. Utilize um cliente compatível com HTML para melhor visualização.',
+            'plain', 'utf-8')
+        msg.attach(parte_texto)
+        parte_html = MIMEText(corpo_html, 'html', 'utf-8')
+        msg.attach(parte_html)
+
+        pdf_bytes = gerar_pdf_html(corpo_html, logger)
+        if pdf_bytes:
+            attach_bytes(msg, pdf_bytes, 'tabela_completa.pdf', 'application', 'pdf')
+
+        xlsx_data = create_xlsx(cabecalho, linhas)
+        attach_bytes(
+            msg,
+            xlsx_data,
+            'processos.xlsx',
+            'application',
+            'vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
+        server = smtplib.SMTP(smtp_config['server'], smtp_config.get('port', 587))
+        server.ehlo()
+        if smtp_config.get('starttls', False):
+            server.starttls()
+            server.ehlo()
+        server.login(smtp_config['user'], smtp_config['password'])
+        server.send_message(msg)
+        server.quit()
+
+        logger.info(f"Email com tabela completa enviado para {len(recipients)} destinatário(s)")
+
+    except Exception as e:
+        logger.error(f"Erro ao enviar tabela completa: {e}")
+
+if __name__ == "__main__":
+    ensure_cron([5, 12, 17], __file__, "sei-aneel")
+    try:
+        resultados = main()
+        sucesso = len([r for r in resultados if r["status"] in ["atualizado", "inserido", "processado"]])
+        total = len(resultados)
+        
+        print(f"\n{Fore.CYAN}{'='*50}")
+        print(f"{Fore.GREEN}🎉 Processamento concluído!")
+        print(f"{Fore.WHITE}📊 Resultados: {Fore.GREEN}{sucesso}{Fore.WHITE}/{Fore.CYAN}{total} {Fore.WHITE}processos processados com sucesso")
+        
+        if total > 0:
+            taxa_sucesso = (sucesso / total) * 100
+            if taxa_sucesso >= 80:
+                print(f"{Fore.GREEN}✨ Excelente taxa de sucesso: {taxa_sucesso:.1f}%")
+            elif taxa_sucesso >= 60:
+                print(f"{Fore.YELLOW}⚠️  Taxa de sucesso moderada: {taxa_sucesso:.1f}%")
+            else:
+                print(f"{Fore.RED}⚠️  Taxa de sucesso baixa: {taxa_sucesso:.1f}% - verifique os logs")
+        
+        print(f"{Fore.CYAN}{'='*50}")
+        
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}⏹️  Execução interrompida pelo usuário.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n{Fore.RED}❌ Erro fatal na execução do script: {e}")
+        sys.exit(1)
