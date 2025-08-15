@@ -5,14 +5,20 @@ import textwrap
 import os
 import sys
 
-from typing import List, Tuple
+from typing import List, Tuple, Union
 import yaml
+from pydantic import ValidationError
 
 from airflow import Dataset
 from airflow.models import Variable
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from schemas import RoDouConfig, DAGConfig
+from schemas import (
+    RoDouConfig,
+    DAGConfig,
+    GenericConfig,
+    GenericDAGConfig,
+)
 
 
 class YAMLParser:
@@ -31,12 +37,22 @@ class YAMLParser:
             dag_config_dict = yaml.safe_load(file)
         return dag_config_dict
 
-    def parse(self) -> DAGConfig:
-        """Processes the config file in order to instantiate the DAG in
-        Airflow.
+    def parse(self) -> Union[DAGConfig, GenericDAGConfig]:
+        """Processes the config file in order to instantiate the DAG in Airflow.
+
+        The parser first tries to load the configuration as a Ro-Dou specific
+        configuration.  If that fails, it attempts to load it as a generic
+        command-based configuration.
         """
-        config = RoDouConfig(**self.read())
-        return config.dag
+
+        data = self.read()
+
+        try:
+            config = RoDouConfig(**data)
+            return config.dag
+        except ValidationError:
+            generic = GenericConfig(**data)
+            return generic.dag
 
         # TODO: remove old parser code
         dag = self._try_get(dag_config_dict, "dag")

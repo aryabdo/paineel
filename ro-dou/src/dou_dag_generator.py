@@ -24,6 +24,7 @@ from airflow.utils.task_group import TaskGroup
 from airflow.hooks.base import BaseHook
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.operators.bash import BashOperator
 from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.slack.notifications.slack import SlackNotifier
@@ -34,7 +35,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from utils.date import get_trigger_date, template_ano_mes_dia_trigger_local_time
 from notification.notifier import Notifier
 from parsers import DAGConfig, YAMLParser
-from schemas import FetchTermsConfig
+from schemas import FetchTermsConfig, GenericDAGConfig
 from searchers import BaseSearcher, DOUSearcher, QDSearcher, INLABSSearcher
 
 
@@ -256,7 +257,63 @@ class DouDigestDagGenerator:
         for filepath in files_list:
             dag_specs = self.parser(filepath).parse()
             dag_id = dag_specs.id
-            globals()[dag_id] = self.create_dag(dag_specs, filepath)
+            if isinstance(dag_specs, DAGConfig):
+                globals()[dag_id] = self.create_dag(dag_specs, filepath)
+            else:
+                globals()[dag_id] = self.create_generic_dag(dag_specs)
+
+    @staticmethod
+    def _run_python(script: str, args: List[str]):
+        """Execute a python script with the provided arguments."""
+        import subprocess
+
+        subprocess.run(["python", script, *args], check=True)
+
+    def create_generic_dag(self, specs: GenericDAGConfig) -> DAG:
+        """Create a DAG that executes generic python or bash scripts."""
+
+        default_args = {
+            "owner": ",".join(specs.owner),
+            "start_date": datetime(2021, 10, 18),
+            "depends_on_past": False,
+            "retries": 0,
+            "on_retry_callback": self.on_retry_callback,
+            "on_failure_callback": self.on_failure_callback,
+        }
+
+        schedule = specs.schedule or self.DEFAULT_SCHEDULE
+
+        dag = DAG(
+            specs.id,
+            default_args=default_args,
+            schedule=schedule,
+            description=specs.description,
+            catchup=False,
+            params=specs.params,
+            tags=list(specs.tags),
+        )
+
+        with dag:
+            previous_task = None
+            for command in specs.commands:
+                task_id = command.task_id or os.path.basename(command.script).replace(".", "_")
+                if command.type.lower() == "bash":
+                    bash_command = (
+                        " ".join([command.script, *command.args]) if command.args else command.script
+                    )
+                    task = BashOperator(task_id=task_id, bash_command=bash_command)
+                else:
+                    task = PythonOperator(
+                        task_id=task_id,
+                        python_callable=self._run_python,
+                        op_kwargs={"script": command.script, "args": command.args or []},
+                    )
+
+                if previous_task:
+                    previous_task >> task
+                previous_task = task
+
+        return dag
 
     def perform_searches(
         self,
